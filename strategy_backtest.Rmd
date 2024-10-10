@@ -1,0 +1,150 @@
+```{r}
+# Load Libraries
+library(data.table)
+library(quantmod)
+library(TTR)
+library(PerformanceAnalytics)
+library(ggplot2)
+
+# Load and Prepare Data
+# Replace this with your actual data loading method
+set.seed(123)
+datetime <- seq.POSIXt(from = as.POSIXct("2024-09-15 09:30"), 
+                       to = as.POSIXct("2024-09-15 16:00"), by = "1 min")
+n <- length(datetime)
+data <- data.table(
+  Datetime = datetime,
+  Open = cumsum(rnorm(n, 0, 0.5)) + 19730,
+  High = cumsum(rnorm(n, 0, 0.5)) + 19735,
+  Low = cumsum(rnorm(n, 0, 0.5)) + 19725,
+  Close = cumsum(rnorm(n, 0, 0.5)) + 19730,
+  Volume = sample(1:10, n, replace = TRUE)
+)
+setorder(data, Datetime)
+
+# Aggregate to 3-Minute Bars and Calculate EMA13
+data[, Period := format(Datetime, "%Y-%m-%d %H:%M")]
+data_3min <- data[, .(
+  Open = first(Open),
+  High = max(High),
+  Low = min(Low),
+  Close = last(Close),
+  Volume = sum(Volume)
+), by = Period]
+data_3min_xts <- xts(data_3min[, .(Open, High, Low, Close, Volume)], 
+                    order.by = as.POSIXct(data_3min$Period))
+data_3min_xts$EMA13 <- EMA(data_3min_xts$Close, n = 13)
+
+# Merge EMA13 back to 1-Minute Data
+data[, EMA13_3min := data_3min_xts$EMA13[findInterval(Datetime, index(data_3min_xts))]]
+
+# Calculate Indicators on 1-Minute Data
+data[, RSI14 := RSI(Close, n = 14)]
+bbands <- BBands(Cl(data), n = 20)
+data[, `:=`(BBands_BB = bbands[,1], BBands_MA = bbands[,2], BBands_UB = bbands[,3])] #[,1] es macd [,2] es sugnal
+macd <- MACD(Cl(data), nFast = 12, nSlow = 26, nSig = 9, maType = EMA)
+data[, `:=`(MACD = macd[,1], MACD_Signal = macd[,2]] # [,1] es macd [,2] es sugnal
+
+# Define Pullback Signals
+data[, `:=`(
+  Body = abs(Close - Open),
+  Range = High - Low,
+  Lower_Wick = Close < Open ? Open - Low : Close - Low,
+  Upper_Wick = Close > Open ? High - Close : High - Open
+)]
+
+# Identify Candlestick Patterns
+data[, Hammer := fifelse(Lower_Wick > 2 * Body & Upper_Wick < Body, TRUE, FALSE)]
+data[, Shooting_Star := fifelse(Upper_Wick > 2 * Body & Lower_Wick < Body, TRUE, FALSE)]
+
+# Define Touch to EMA
+data[, `:=`(
+  Previous_Close = shift(Close, 1),
+  Previous_EMA13 = shift(EMA13_3min, 1)
+)]
+data[, TouchEMA := fifelse(
+  (Close >= EMA13_3min & Previous_Close < Previous_EMA13) |
+    (Close <= EMA13_3min & Previous_Close > Previous_EMA13),
+  TRUE, FALSE
+)]
+
+# Define RSI and MACD Confirmation
+data[, `:=`(
+  RSI_Confirmation = fifelse(RSI14 < 30, "Oversold", fifelse(RSI14 > 70, "Overbought", "Neutral")),
+  MACD_Confirmation = fifelse(MACD > MACD_Signal, "Bullish", "Bearish")
+)]
+
+# Update Pullback Signal with Confirmations
+data[, Pullback_Signal := fifelse(
+  TouchEMA & (
+    (RSI_Confirmation == "Overbought" & Shooting_Star & MACD_Confirmation == "Bearish") |
+    (RSI_Confirmation == "Oversold" & Hammer & MACD_Confirmation == "Bullish")
+  ),
+  TRUE, FALSE
+)]
+
+# Execute Trades
+data[, `:=`(
+  Position = 0,
+  Entry_Price = NA_real_,
+  Exit_Price = NA_real_,
+  Strategy_Return = 0
+)]
+
+for (i in 2:nrow(data)) {
+  if (data$Pullback_Signal[i] == TRUE && data$Position[i-1] == 0) {
+    # Enter Long Position
+    data$Position[i] <- 1
+    data$Entry_Price[i] <- data$Close[i]
+  } else if (data$Position[i-1] == 1) {
+    # Exit Condition: Price crosses below EMA13
+    if (data$Close[i] < data$EMA13_3min[i]) {
+      data$Position[i] <- 0
+      data$Exit_Price[i] <- data$Close[i]
+      data$Strategy_Return[i] <- (data$Exit_Price[i] - data$Entry_Price[i]) / data$Entry_Price[i]
+    } else {
+      data$Position[i] <- 1
+      data$Strategy_Return[i] <- 0
+    }
+  }
+}
+
+# Calculate Cumulative Returns
+data[, Cumulative_Return := cumprod(1 + Strategy_Return, na.rm = TRUE)]
+
+# Convert Strategy_Return to xts for Performance Analysis
+strategy_returns_xts <- xts(data$Strategy_Return, order.by = data$Datetime)
+
+# Plot Performance Summary
+charts.PerformanceSummary(strategy_returns_xts, main = "Strategy Performance Summary")
+
+# Calculate Performance Metrics
+total_return <- sum(strategy_returns_xts, na.rm = TRUE)
+annualized_return <- Return.annualized(strategy_returns_xts)
+annualized_volatility <- StdDev.annualized(strategy_returns_xts)
+sharpe_ratio <- SharpeRatio.annualized(strategy_returns_xts, Rf = 0)
+
+# Display Metrics
+cat("Total Return:", round(total_return * 100, 2), "%\n")
+cat("Annualized Return:", round(annualized_return * 100, 2), "%\n")
+cat("Annualized Volatility:", round(annualized_volatility * 100, 2), "%\n")
+cat("Sharpe Ratio:", round(sharpe_ratio, 2), "\n")
+
+# Visualize Trade Signals
+plot_data <- data[Datetime >= as.POSIXct("2024-09-15 09:30") & 
+                   Datetime <= as.POSIXct("2024-09-15 16:00")]
+
+ggplot(plot_data, aes(x = Datetime)) +
+  geom_line(aes(y = Close, color = "Close Price")) +
+  geom_line(aes(y = EMA13_3min, color = "13-Period EMA")) +
+  geom_point(data = plot_data[Pullback_Signal == TRUE], 
+             aes(y = Close), 
+             color = "red", shape = 24, size = 3, fill = "red") +
+  labs(title = "Price with 13-Period EMA and Pullback Signals",
+       y = "Price",
+       x = "Datetime") +
+  scale_color_manual(values = c("Close Price" = "black", "13-Period EMA" = "blue")) +
+  theme_minimal()
+
+```
+
